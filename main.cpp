@@ -119,6 +119,8 @@ struct Tile {
 	bool bombed{ false };
 	bool bombOnX{ false };
 	bool bombOnY{ false };
+	bool spawned{ false };
+	bool simulated{ false };
 	Bomb* bomb{ nullptr };
 	int explodesIn{ 0 };
 	int points{ 0 };
@@ -126,7 +128,7 @@ struct Tile {
 	vector<Tile*> boxedBombItems;
 	vector<Tile*>* path;
 	Direction bombLocation;
-	vector<Bomb*>targetBombs;
+	vector<Bomb*>* targetBombs = new vector<Bomb*>;
 
 	Tile* right{ nullptr };
 	Tile* left{ nullptr };
@@ -209,7 +211,9 @@ void Tile::reset() {
 	bombOnX = false;
 	bombOnY = false;
 	bombLocation = Direction::none;
-	targetBombs.clear();
+	targetBombs->clear();
+	spawned = false;
+	simulated = false;
 }
 
 void Tile::addItem(Item* it) {
@@ -237,33 +241,35 @@ void Tile::mark(char ch) {
 void Tile::addBomb(Bomb* b, bool simulate) {
 	if (bomb == nullptr || b->range > bomb->range)
 		bomb = b;
-	if(!simulate)
-		hasBomb = true;
-	setExplodeTime(b->timer, b->range, Direction::all, b);
+	hasBomb = true;
+	setExplodeTime(b->timer, b->range, Direction::all, b, simulate);
 	if(!simulate)
 		map[b->y][b->x] = 'Z';
+	else hasBomb = false;
 }
 
 void Tile::setExplodeTime(int timer, int range, Direction direction, Bomb* bombe, bool simulate) {
-	bool duplicate = false;
-	for (int i = 0; i < targetBombs.size(); i++) {
-		if (targetBombs.at(i) == bombe) {
+	bool duplicate = false;	
+	for (int i = 0; i < targetBombs->size(); i++) {	
+		if (targetBombs->at(i) == bombe) {
 			duplicate = true;
 			break;
 		}
 	}
 	if (!duplicate)
-		targetBombs.push_back(bombe);
+		targetBombs->push_back(bombe);
 
 
 	if (hasBomb) {
-		if (timer == explodesIn && range < bomb->range)
+		if (timer == explodesIn && spawned)
 			return;
 
 		if (timer < explodesIn || explodesIn == 0)
 			explodesIn = timer;
 
-		range--;
+		range = bomb->range -1;		
+		spawned = true;
+
 		if (left != nullptr) left->setExplodeTime(explodesIn, range, Direction::left, bombe, simulate);
 		if (top != nullptr) top->setExplodeTime(explodesIn, range, Direction::top, bombe, simulate);
 		if (bottom != nullptr) bottom->setExplodeTime(explodesIn, range, Direction::bottom, bombe, simulate);
@@ -278,8 +284,11 @@ void Tile::setExplodeTime(int timer, int range, Direction direction, Bomb* bombe
 			explodesIn = timer;
 	}
 	else {
-		if (timer < explodesIn || explodesIn == 0)
+		if (timer < explodesIn || explodesIn == 0) {
 			explodesIn = timer;
+			if (simulate)
+				simulated = true;
+		}
 
 		range--;
 		if (range > 0) {
@@ -421,7 +430,7 @@ struct Radar {
 	tuple<string, int, int> nextMove();
 	int shortestPath(Tile* source, Tile* dest);
 	vector<Tile*>* loadReachableSpots();
-	void removeSuicidePlantTile(vector<Tile*>* tiles);
+	void removeSuicidePlantTile(vector<Tile*>* tiles, vector<Tile*>* allTiles);
 	bool isInExplosionRange(Tile* a, Tile* b);
 	bool isObstacleBetween(Tile* a, Tile* b, int range); ;
 	void sortLocations(vector<Tile*>* reachable);
@@ -430,6 +439,7 @@ struct Radar {
 	bool canReachSaferTile(Tile* t);
 	bool verifySecondChoicePlant(Tile* ct, Tile* dt, vector<Tile*>* reachable);
 	bool simulatePlant(vector<Tile*>* reachable);
+	Tile* saferTile();
 };
 
 void Radar::reset() {
@@ -595,7 +605,7 @@ bool Radar::isInExplosionRange(Tile* a, Tile* b) {
 	}
 }
 
-void Radar::removeSuicidePlantTile(vector<Tile*>* tiles) {
+void Radar::removeSuicidePlantTile(vector<Tile*>* tiles, vector<Tile*>* allTiles) {
 	for (int i = 0; i < tiles->size(); i++) {
 		auto bt = tiles->at(i);
 		if (bt->explodesIn <= newBombTimer && newBombTimer > 0 && bt->explodesIn > 0) {
@@ -616,8 +626,22 @@ void Radar::removeSuicidePlantTile(vector<Tile*>* tiles) {
 			if (t->y != bt->y && t->x != bt->x)
 				return true;
 
-			if (isInExplosionRange(bt, t))
-				return false;
+			if (isInExplosionRange(bt, t)) {
+				auto it = find_if(tiles->begin(), tiles->end(), [&](Tile* t2) {
+					if (t2->explodesIn == 0)
+						return false;
+
+					if (t2 == t || t2 == bt)
+						return false;
+
+					if (t2->explodesIn <= 5)
+						return true;
+				});
+
+				if(it == tiles->end())
+					return false;
+				return true;
+			}
 
 			return true;
 		});
@@ -627,7 +651,7 @@ void Radar::removeSuicidePlantTile(vector<Tile*>* tiles) {
 }
 
 void Radar::sortLocations(vector<Tile*>* reachable) {
-	if (reachable->empty()) return;
+	if (reachable->empty() || reachable->size() == 1) return;
 	sort(reachable->begin(), reachable->end(), [&](const Tile* lhs, const Tile* rhs) {
 		if (lhs->distance <= 2 && lhs->hasItem && maxBombs <= 3)
 			return true;
@@ -641,52 +665,26 @@ void Radar::sortLocations(vector<Tile*>* reachable) {
 				return false;
 		}
 
+		int lhsScore, rhsScore;
+		if (lhs->points == 0)
+			lhsScore = -100;
+		else lhsScore = lhs->points - lhs->distance;
 
-		if (lhs->points > 0 && lhs->distance <= 3 && rhs->points > 0 && rhs->distance <= 3) {
-			if (lhs->points > rhs->points)
-				return true;
-			if (rhs->points > lhs->points)
-				return false;
-			if (lhs->points == rhs->points) {
-				if (lhs->distance < rhs->distance )
-					return true;
-				if (rhs->distance < lhs->distance)
-					return false;
-				if (lhs->distance == rhs->distance) 
-					return lhs->boxedBombItems.size() > rhs->boxedBombItems.size();				
-			}
-		}
+		if (rhs->points == 0)
+			rhsScore = -100;
+		else rhsScore = rhs->points - rhs->distance;
 
-		if (lhs->distance < rhs->distance && lhs->points > 0) {
-			if (abs(lhs->distance - rhs->distance) <= 2)
-				return lhs->boxedBombItems.size() > rhs->boxedBombItems.size();		
-			return true;
-		}
-			
-		if (rhs->distance < lhs->distance && rhs->points > 0) {
-			if (abs(lhs->distance - rhs->distance) <= 2)
-				return lhs->boxedBombItems.size() > rhs->boxedBombItems.size();
-			return false;
-		}
-			
+		if(lhsScore == -100 && rhsScore == -100)
+			return lhs->distance < rhs->distance;
 
-		if (lhs->distance == rhs->distance && lhs->points > 0 && rhs->points > 0) {
-			if (lhs->points > rhs->points)
-				return true;
-			if (rhs->points > lhs->points)
-				return false;
-			if (lhs->points == rhs->points) {
-				return lhs->boxedBombItems > rhs->boxedBombItems;
-			}
-		}
-
-		return lhs->points > rhs->points;
-
-
+		return lhsScore > rhsScore;
 	});
 }
 
 bool Radar::canReachSaferTile(Tile* t) {
+	if (t->explodesIn == 0)
+		return true;
+
 	int x = t->x;
 	int y = t->y;
 	int dv[2][4] = { {-1,+1,0,0}, {0,0,+1,-1} };
@@ -700,11 +698,60 @@ bool Radar::canReachSaferTile(Tile* t) {
 		if (!f[yy][xx]->isWalkable()) continue;
 
 		auto t2 = f[yy][xx];
-		int timer = t2->explodesIn;
-		if ((timer == 0 || timer > t->explodesIn + 2) || (t->explodesIn > 4 && t->explodesIn > 0))
-			return true;
+		int timer = t2->explodesIn;		
+		if ((timer == 0 || timer > t->explodesIn + 2))
+			return true;	
+			
 	}
 	return false;
+}
+
+Tile* Radar::saferTile() {
+	int x = p->x;
+	int y = p->y;
+	auto ct = f[y][x];
+	if (ct->explodesIn == 0)
+		return nullptr;
+	int dv[2][4] = { {-1,+1,0,0}, {0,0,+1,-1} };
+	for (int i = 0; i < 4; i++) {
+		int yy = y + dv[0][i];
+		int xx = x + dv[1][i];
+
+		if (yy < 0 || yy >= h) continue;
+		if (xx < 0 || xx >= w) continue;
+
+		if (!f[yy][xx]->isWalkable()) continue;
+
+		cerr << "checking: " << xx << " " << yy <<" "<< f[yy][xx]->explodesIn<< endl;
+
+		auto t2 = f[yy][xx];
+		int timer = t2->explodesIn;
+		if (timer == 0 || timer >= ct->explodesIn + 3) {
+			cerr<<"SAFER "<<t2->explodesIn<<" - "<<ct->explodesIn<<endl;
+			return t2;
+		}
+	}
+
+	for (int i = 0; i < 4; i++) {
+		int yy = y + dv[0][i];
+		int xx = x + dv[1][i];
+
+		if (yy < 0 || yy >= h) continue;
+		if (xx < 0 || xx >= w) continue;
+
+		if (!f[yy][xx]->isWalkable()) continue;
+
+		cerr << "checking: " << xx << " " << yy << " " << f[yy][xx]->explodesIn << endl;
+
+		auto t2 = f[yy][xx];
+		int timer = t2->explodesIn;
+		if (timer > ct->explodesIn || timer <= 3 && t2->simulated) {
+			cerr << "SAFER " << t2->explodesIn << " - " << ct->explodesIn << endl;
+			return t2;
+		}
+	}
+
+	return nullptr;
 }
 
 void Radar::removeExplosivePaths(vector<Tile*>* reachable) {
@@ -725,39 +772,55 @@ void Radar::removeExplosivePaths(vector<Tile*>* reachable) {
 			auto t = dt->path->at(0);
 			reachable->erase(reachable->begin() + i--);
 		}*/
-		int item = 999; int ix, iy;
-		bool bombX = false;
-		bool bombY = false;
-		Tile* titem = nullptr;
+
+		bool itemOnWay = false;
+		int ix, iy;
+		int itemExplodesIn;
+		vector<Bomb*>* targets;
 		for (int j = 0; j < dt->path->size(); j++) {
 			auto t = dt->path->at(j);
 			//cerr <<t->x << " " << t->y << " "<<t->explodesIn<<endl;
-			if (t->explodesIn == 0)
+			if (t->explodesIn == 0 && !itemOnWay)
 				continue;
 			if (t->hasItem) {
-				item = t->explodesIn - 2;
-				ix = t->x;
-				iy = t->y;
-				bombX = t->bombOnX;
-				bombY = t->bombOnY;
-				titem = t;
+				itemOnWay = true;
+				itemExplodesIn = t->explodesIn;
+				ix = t->x; iy = t->y;
+				targets = t->targetBombs;
 			}
-			if (t->explodesIn < j+1 && t->targetBombs.size() == 1)
+			
+			if (t->explodesIn < j+1 && t->targetBombs->size() == 1)
 				continue;
 			if (t->explodesIn <= 2 + j) {
 				reachable->erase(reachable->begin() + i--);
 				break;
 			}
-			if (item <= 2 + j) {
-				if (bombX && t->y == titem->y) {
-					reachable->erase(reachable->begin() + i--);
-					break;
+
+			if (itemOnWay && ((t->x == ix || t->y == iy) && !(t->x == ix && t->y == iy))) {
+				cerr<<"ITEM on the way.. "<<t->x<<" "<<t->y<<endl;
+				bool willExplode = false;
+				for (auto& b : *targets) {
+					if (b->x == t->x) {
+						if (abs(t->x - b->x) <= b->range) {
+							willExplode = true;
+							break;
+						}
+					}
+					if (b->y == t->y) {
+						if (abs(t->y - b->y) <= b->range) {
+							willExplode = true;
+							break;
+						}
+					}
 				}
-				if (bombY && t->x == titem->x) {
+
+				if (willExplode && itemExplodesIn <= 2 + j) {
+					cerr<<"ITEM SHIELDED: "<<t->x<<" "<<t->y<<endl;
 					reachable->erase(reachable->begin() + i--);
 					break;
 				}
 			}
+
 		}
 	}
 	for (int i = 0; i < reachable->size(); i++) {
@@ -796,19 +859,20 @@ bool Radar::verifySecondChoicePlant(Tile* ct, Tile* dt, vector<Tile*>* reachable
 bool Radar::simulatePlant(vector<Tile*>* reachable) {
 	auto dest = new vector<Tile*>(reachable->size());
 	copy(reachable->begin(), reachable->end(), dest->begin());
+	cerr << "simulating plant" << endl;
 	f[p->y][p->x]->addBomb(new Bomb(Type::bomb, myId, p->x, p->y, 8, p->range));
 	for (auto& t : *dest) {
 		t->calculatePoints();
 	}
 	removeExplosivePaths(dest);
-	removeSuicidePlantTile(dest);
+	removeSuicidePlantTile(dest, reachable);
 	sortLocations(dest);
 
 	cerr << endl;
-	cerr << "simulating plant" << endl;
+	
 	cerr << "----------------------------" << endl;
 	for (auto& r : *dest)
-		cerr << r->x << " " << r->y << " PTS: " << r->points << " DIST: " << r->distance << " +BOMBS: " << r->boxedBombItems.size() << " PATH SIZE: " << r->path->size() << endl;
+		cerr << r->x << " " << r->y << " PTS: " << r->points << " DIST: " << r->distance << " +BOMBS: " << r->boxedBombItems.size() << " PATH SIZE: " << r->path->size() << " Explodes in: " << r->explodesIn << endl;
 	cerr << "----------------------------" << endl;
 	cerr << endl;
 
@@ -818,8 +882,8 @@ bool Radar::simulatePlant(vector<Tile*>* reachable) {
 	bool noExpld = false;
 	for (int i = 1; i < dest->size(); i++) {
 		if (dest->at(i)->path != nullptr && !dest->at(i)->path->empty() && dest->at(i)->explodesIn == 0) {
-			nX = dest->at(i)->x;
-			nY = dest->at(i)->y;
+			nX = dest->at(i)->path->at(0)->x;
+			nY = dest->at(i)->path->at(0)->y;
 			noExpld = true;
 			break;
 		}
@@ -845,9 +909,11 @@ tuple<string, int, int> Radar::nextMove() {
 	for (auto& p2 : *players) {
 		if (p2->owner != myId) {
 			int distance = shortestPath(f[p->y][p->x], f[p2->y][p2->x]);
-			if (distance != -1 && (distance >=1 && distance <=3)) {
-				if (p2->nBombs > 0 || p2->newBombIn == 1)
-					f[p2->y][p2->x]->addBomb(new Bomb(Type::bomb, p2->owner, p2->x, p2->y, 8+1, p2->range), true);
+			if (distance != -1 &&  distance <= 4) {
+				if (p2->nBombs > 0 || p2->newBombIn == 1) {
+					f[p2->y][p2->x]->addBomb(new Bomb(Type::bomb, p2->owner, p2->x, p2->y, 8, p2->range), true);
+					cerr << "adding bomb: " << p2->x << " " << p2->y << endl;
+				}
 			}
 		}
 	}
@@ -868,13 +934,13 @@ tuple<string, int, int> Radar::nextMove() {
 	cerr << "sorted: " << dest->size() << endl;
 
 	if (p->nBombs)
-		removeSuicidePlantTile(dest);
+		removeSuicidePlantTile(dest, reachable);
 	else removeAboutToExplodeTile(dest);
 
 	cerr << "no suicide: " << dest->size() << endl;
 	cerr << "----------------------------" << endl;
 	for (auto& r : *dest)
-		cerr << r->x << " " << r->y << " PTS: " << r->points << " DIST: " << r->distance << " +BOMBS: " << r->boxedBombItems.size() << " PATH SIZE: " << r->path->size() << endl;
+		cerr << r->x << " " << r->y << " PTS: " << r->points << " DIST: " << r->distance << " +BOMBS: " << r->boxedBombItems.size() << " PATH SIZE: " << r->path->size() << " Explodes in: "<<r->explodesIn<<endl;
 	cerr << "----------------------------" << endl;
 
 	auto ct = f[p->y][p->x];
@@ -914,8 +980,19 @@ tuple<string, int, int> Radar::nextMove() {
 				nY = dest->at(0)->y;
 			}
 			else {
-				nX = p->x;
-				nY = p->y;
+				Tile* safer = nullptr;
+				if (ct->explodesIn > 0)
+					safer = saferTile();
+
+				if (safer != nullptr) {
+					cerr << "GO SAFER: " << safer->x << " " << safer->y << endl;
+					nX = safer->x;
+					nY = safer->y;
+				}
+				else {
+					nX = p->x;
+					nY = p->y;
+				}
 			}
 		}
 		else {
